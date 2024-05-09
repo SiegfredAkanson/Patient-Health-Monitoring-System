@@ -1,0 +1,196 @@
+from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM
+from machine import SoftI2C, Pin, Timer 
+from utime import ticks_diff, ticks_us
+import time
+import network
+from umqtt.robust import MQTTClient
+import sys
+import random
+
+
+led = Pin(19, Pin.OUT)
+
+MAX_HISTORY = 32
+history = []
+beats_history = []
+beat = False
+beats = 0
+    
+i2c = SoftI2C(sda=Pin(21),scl=Pin(22),freq=400000)
+sensor = MAX30102(i2c=i2c)  # An I2C instance is required
+
+
+
+WIFI_SSID     = 'MyWifi'
+WIFI_PASSWORD = ''
+
+mqtt_client_id      = bytes('client_'+'12329', 'utf-8') # Just a random client ID
+
+ADAFRUIT_IO_URL     = 'io.adafruit.com' 
+ADAFRUIT_USERNAME   = 'Siegfred'
+ADAFRUIT_IO_KEY     = 'aio_UiNR21p8UMy1NLi0BMkur31TxKwg'
+
+
+TEMP_FEED_ID      = 'temperature'
+HEART_FEED_ID      = 'heart'
+
+wifi = None
+
+def connect_wifi():
+    global wifi
+    wifi = network.WLAN(network.STA_IF)
+    wifi.active(True)
+    wifi.disconnect()
+    wifi.connect(WIFI_SSID,WIFI_PASSWORD)
+    if not wifi.isconnected():
+        print('connecting..')
+        timeout = 0
+        while (not wifi.isconnected() and timeout < 5):
+            print(5 - timeout)
+            timeout = timeout + 1
+            time.sleep(1) 
+    if(wifi.isconnected()):
+        print('connected')
+        print('network config:', wifi.ifconfig())
+    else:
+        print('not connected')
+        sys.exit()
+        
+
+connect_wifi() # Connecting to WiFi Router 
+
+if sensor.i2c_address not in i2c.scan():
+    print("Sensor not found.")
+    
+elif not (sensor.check_part_id()):
+    # Check that the targeted sensor is compatible
+    print("I2C device ID not corresponding to MAX30102 or MAX30105.")
+    
+else:
+    print("Sensor connected and recognized.")
+
+# It's possible to set up the sensor at once with the setup_sensor() method.
+# If no parameters are supplied, the default config is loaded:
+# Led mode: 2 (RED + IR)
+# ADC range: 16384
+# Sample rate: 400 Hz
+# Led power: maximum (50.0mA - Presence detection of ~12 inch)
+# Averaged samples: 8
+# pulse width: 411
+print("Setting up sensor with default configuration.", '\n')
+sensor.setup_sensor()
+# 
+# # It is also possible to tune the configuration parameters one by one.
+# # Set the sample rate to 400: 400 samples/s are collected by the sensor
+sensor.set_sample_rate(400)
+# Set the number of samples to be averaged per each reading
+sensor.set_fifo_average(8)
+# Set LED brightness to a medium value
+sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM)
+sensor.set_led_mode(2)
+time.sleep(1)
+
+
+t_start = ticks_us()  # Starting time of the acquisition   
+
+
+client = MQTTClient(client_id=mqtt_client_id, 
+                    server=ADAFRUIT_IO_URL, 
+                    user=ADAFRUIT_USERNAME, 
+                    password=ADAFRUIT_IO_KEY,
+                    ssl=False)
+
+
+def setup_mqtt_client():
+    try:
+        time.sleep(5)
+        if wifi.isconnected():
+            print("wifi is connected, connecting to mqtt broker....")
+            client.connect()
+            print("mqtt broker connected")
+            time.sleep(5)
+    except Exception as e:
+        print('could not connect to MQTT server {}{}'.format(type(e).__name__, e))
+        sys.exit()
+
+
+setup_mqtt_client()
+
+temp_feed = bytes('{:s}/feeds/{:s}'.format(ADAFRUIT_USERNAME, TEMP_FEED_ID), 'utf-8') # format - techiesms/feeds/temp
+hum_feed = bytes('{:s}/feeds/{:s}'.format(ADAFRUIT_USERNAME, HEART_FEED_ID), 'utf-8') # format - techiesms/feeds/hum   
+
+
+def sens_data(data):
+    global beats
+    temperature = sensor.read_temperature()
+    client.publish(temp_feed,    
+                  bytes(str(temperature), 'utf-8'),   # Publishing Temp feed to adafruit.io
+                  qos=0)
+    
+    client.publish(hum_feed,    
+                  bytes(str(beats), 'utf-8'),   # Publishing Hum feed to adafruit.io
+                  qos=0)
+    print("Temp - ", str(temperature))
+    print("BPM - " , str(beats))
+    print('Msg sent')
+    
+    
+    
+timer = Timer(0)
+timer.init(period=5000, mode=Timer.PERIODIC, callback = sens_data)
+    
+    
+    
+
+# Scan I2C bus to ensure that the sensor is connected
+
+print("Executing while loop")
+while True:
+    if not wifi.isconnected():
+        pass
+    # The check() method has to be continuously polled, to check if
+    # there are new readings into the sensor's FIFO queue. When new
+    # readings are available, this function will put them into the storage.
+    sensor.check()
+
+    # Check if the storage contains available samples
+    if sensor.available():
+        # Access the storage FIFO and gather the readings (integers)
+        red_reading = sensor.pop_red_from_storage()
+        ir_reading = sensor.pop_ir_from_storage()
+        
+        value = red_reading
+        history.append(value)
+        # Get the tail, up to MAX_HISTORY length
+        history = history[-MAX_HISTORY:]
+        minima = 0
+        maxima = 0
+        threshold_on = 0
+        threshold_off = 0
+
+        minima, maxima = min(history), max(history)
+
+        threshold_on = (minima + maxima * 3) // 4   # 3/4
+        threshold_off = (minima + maxima) // 2      # 1/2
+        
+        if value > 1000:
+            if not beat and value > threshold_on:
+                beat = True                    
+                led.on()
+                t_us = ticks_diff(ticks_us(), t_start)
+                t_s = t_us/1000000
+                f = 1/t_s
+                bpm = f * 60
+                if bpm < 500:
+                    t_start = ticks_us()
+                    beats_history.append(bpm)                    
+                    beats_history = beats_history[-MAX_HISTORY:] 
+                    beats = round(sum(beats_history)/len(beats_history) ,2)                    
+            if beat and value< threshold_off:
+                beat = False
+                led.off()
+            
+        else:
+            led.off()
+            print('Not finger')
+
